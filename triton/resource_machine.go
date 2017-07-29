@@ -328,7 +328,10 @@ func resourceMachineCreate(d *schema.ResourceData, meta interface{}) error {
 				return nil, "", fmt.Errorf("instance creation failed: %s", inst.State)
 			}
 
-			return inst, inst.State, nil
+			if hasValidDomainNames(d, inst) {
+				return inst, inst.State, nil
+			}
+			return inst, machineStateProvisioning, nil
 		},
 		Timeout:    machineStateChangeTimeout,
 		MinTimeout: 3 * time.Second,
@@ -521,9 +524,6 @@ func resourceMachineUpdate(d *schema.ResourceData, meta interface{}) error {
 			return err
 		}
 
-		oldCNS, newCNS := d.GetChange("cns.0.services")
-		oldServices, newServices := castToTypeList(oldCNS), castToTypeList(newCNS)
-
 		expectedTags, err := hashstructure.Hash([]interface{}{tags, cns, true}, nil)
 		if err != nil {
 			return err
@@ -538,46 +538,7 @@ func resourceMachineUpdate(d *schema.ResourceData, meta interface{}) error {
 					return nil, "", err
 				}
 
-				// Make sure all new CNS domain names have converged and that
-				// all old service domain names have expired. This helps store
-				// the proper converged domain names in our state file that
-				// match our CNS services tag.
-				domainCheck := true
-				if d.HasChange("cns") {
-					domains := map[string]bool{}
-					for _, domain := range inst.DomainNames {
-						name := strings.Split(domain, ".")[0]
-						domains[name] = true
-					}
-					disableRaw := d.Get("cns.0.disable")
-					cnsDisabled := disableRaw.(bool)
-					if cnsDisabled {
-						if len(domains) != 0 {
-							domainCheck = false
-						}
-					} else {
-						// check domains for new services that are missing
-						checked := map[string]bool{}
-						for _, newService := range newServices {
-							checked[newService] = true
-							if _, exists := domains[newService]; !exists {
-								domainCheck = false
-							}
-						}
-
-						if domainCheck {
-							// check domains for any services that have expired
-							for _, oldService := range oldServices {
-								if _, exists := domains[oldService]; exists {
-									if _, already := checked[oldService]; !already {
-										domainCheck = false
-									}
-								}
-							}
-						}
-					}
-				}
-
+				domainCheck := hasValidDomainNames(d, inst)
 				hashTags, err := hashstructure.Hash([]interface{}{inst.Tags, inst.CNS, domainCheck}, nil)
 				if err != nil {
 					return nil, "", err
@@ -823,4 +784,58 @@ func castToTypeList(sliceRaw interface{}) []string {
 		result[iter] = fmt.Sprint(member)
 	}
 	return result
+}
+
+// hasValidDomainNames makes sure domain names have converged for various
+// reasons. This could be because CNS services have been added, changed, or
+// disabled. We could also have nothing to do with CNS and we only need to
+// validate our normal instance domains.
+//
+// This helps store the proper converged domain names in our
+// state file that match our instance name and CNS services tag.
+func hasValidDomainNames(d *schema.ResourceData, inst *compute.Instance) bool {
+	// If we no longer have CNS than we don't want empty domain names.
+	if _, hasCNS := d.GetOk("cns"); !hasCNS {
+		if len(inst.DomainNames) == 0 {
+			return false
+		}
+	}
+
+	// If CNS has been disabled than we need domain names.
+	disableRaw := d.Get("cns.0.disable")
+	disabled := disableRaw.(bool)
+	if disabled {
+		if len(inst.DomainNames) != 0 {
+			return false
+		}
+	} else {
+		oldCNS, newCNS := d.GetChange("cns.0.services")
+		// Index domains so we can O(1) check them
+		domains := map[string]bool{}
+		for _, domain := range inst.DomainNames {
+			name := strings.Split(domain, ".")[0]
+			domains[name] = true
+		}
+
+		// check domains for new services that are missing
+		checked := map[string]bool{}
+		newServices := castToTypeList(newCNS)
+		for _, newService := range newServices {
+			checked[newService] = true
+			if _, exists := domains[newService]; !exists {
+				return false
+			}
+		}
+
+		oldServices := castToTypeList(oldCNS)
+		// check domains for any services that have expired
+		for _, oldService := range oldServices {
+			if _, exists := domains[oldService]; exists {
+				if _, already := checked[oldService]; !already {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
