@@ -282,11 +282,6 @@ func resourceMachineCreate(d *schema.ResourceData, meta interface{}) error {
 		cnsList := cnsRaw.([]interface{})
 		for k, v := range cnsList[0].(map[string]interface{}) {
 			switch k {
-			case "disable":
-				b := v.(bool)
-				if b {
-					cns.Disable = b
-				}
 			case "services":
 				servicesRaw := v.([]interface{})
 				cns.Services = make([]string, 0, len(servicesRaw))
@@ -328,7 +323,7 @@ func resourceMachineCreate(d *schema.ResourceData, meta interface{}) error {
 				return nil, "", fmt.Errorf("instance creation failed: %s", inst.State)
 			}
 
-			if hasValidDomainNames(d, inst) {
+			if hasInitDomainNames(d, inst) {
 				return inst, inst.State, nil
 			}
 			return inst, machineStateProvisioning, nil
@@ -835,6 +830,45 @@ func hasValidDomainNames(d *schema.ResourceData, inst *compute.Instance) bool {
 					return false
 				}
 			}
+		}
+	}
+	return true
+}
+
+// hasValidDomainNames makes sure domain names have converged for various
+// reasons. This could be because CNS services have been added, changed, or
+// disabled. We could also have nothing to do with CNS and we only need to
+// validate our normal instance domains.
+//
+// This helps store the proper converged domain names in our
+// state file that match our instance name and CNS services tag.
+func hasInitDomainNames(d *schema.ResourceData, inst *compute.Instance) bool {
+	// If we no longer have CNS than we don't want empty domain names.
+	if _, hasCNS := d.GetOk("cns"); !hasCNS {
+		if len(inst.DomainNames) == 0 {
+			return false
+		}
+	}
+
+	servicesRaw := d.Get("cns.0.services")
+	newServices := castToTypeList(servicesRaw)
+	if len(newServices) == 0 {
+		return true
+	}
+
+	// Index domains so we can O(1) check them
+	domains := map[string]bool{}
+	for _, domain := range inst.DomainNames {
+		name := strings.Split(domain, ".")[0]
+		domains[name] = true
+	}
+
+	// check domains for new services that are missing
+	checked := map[string]bool{}
+	for _, newService := range newServices {
+		checked[newService] = true
+		if _, exists := domains[newService]; !exists {
+			return false
 		}
 	}
 	return true
