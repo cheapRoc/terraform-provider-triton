@@ -521,7 +521,10 @@ func resourceMachineUpdate(d *schema.ResourceData, meta interface{}) error {
 			return err
 		}
 
-		expectedTags, err := hashstructure.Hash([]interface{}{tags, cns}, nil)
+		oldCNS, newCNS := d.GetChange("cns.0.services")
+		oldServices, newServices := castToTypeList(oldCNS), castToTypeList(newCNS)
+
+		expectedTags, err := hashstructure.Hash([]interface{}{tags, cns, true}, nil)
 		if err != nil {
 			return err
 		}
@@ -535,7 +538,47 @@ func resourceMachineUpdate(d *schema.ResourceData, meta interface{}) error {
 					return nil, "", err
 				}
 
-				hashTags, err := hashstructure.Hash([]interface{}{inst.Tags, inst.CNS}, nil)
+				// Make sure all new CNS domain names have converged and that
+				// all old service domain names have expired. This helps store
+				// the proper converged domain names in our state file that
+				// match our CNS services tag.
+				domainCheck := true
+				if d.HasChange("cns") {
+					domains := map[string]bool{}
+					for _, domain := range inst.DomainNames {
+						name := strings.Split(domain, ".")[0]
+						domains[name] = true
+					}
+					disableRaw := d.Get("cns.0.disable")
+					cnsDisabled := disableRaw.(bool)
+					if cnsDisabled {
+						if len(domains) != 0 {
+							domainCheck = false
+						}
+					} else {
+						// check domains for new services that are missing
+						checked := map[string]bool{}
+						for _, newService := range newServices {
+							checked[newService] = true
+							if _, exists := domains[newService]; !exists {
+								domainCheck = false
+							}
+						}
+
+						if domainCheck {
+							// check domains for any services that have expired
+							for _, oldService := range oldServices {
+								if _, exists := domains[oldService]; exists {
+									if _, already := checked[oldService]; !already {
+										domainCheck = false
+									}
+								}
+							}
+						}
+					}
+				}
+
+				hashTags, err := hashstructure.Hash([]interface{}{inst.Tags, inst.CNS, domainCheck}, nil)
 				if err != nil {
 					return nil, "", err
 				}
@@ -768,4 +811,16 @@ func resourceMachineValidateName(value interface{}, name string) (warnings []str
 	}
 
 	return warnings, errors
+}
+
+// castToTypeList casts an interface slice back into a proper slice of
+// strings. This handles pulling services out of various nested interface
+// collections that Terraform stores them under.
+func castToTypeList(sliceRaw interface{}) []string {
+	slice := sliceRaw.([]interface{})
+	result := make([]string, len(slice))
+	for iter, member := range slice {
+		result[iter] = fmt.Sprint(member)
+	}
+	return result
 }
